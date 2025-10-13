@@ -1,0 +1,2 @@
+choreonoid_add_simple_controller(YourDroneController YourDroneController.cpp)
+target_link_libraries(YourDroneController CnoidCFDPlugin)
