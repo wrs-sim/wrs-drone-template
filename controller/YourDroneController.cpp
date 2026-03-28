@@ -4,193 +4,256 @@
 */
 
 #include <cnoid/EigenUtil>
-#include <cnoid/Joystick>
+#include <cnoid/RateGyroSensor>
 #include <cnoid/Rotor>
-#include <cnoid/SharedJoystick>
 #include <cnoid/SimpleController>
-#include <cnoid/SimplePilot>
-#include <vector>
-
-using namespace cnoid;
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <sensor_msgs/msg/battery_state.hpp>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 namespace {
 
-const double pgain[] = {10.0, 1.0, 1.0, 0.01};
-const double dgain[] = {5.0, 1.0, 1.0, 0.002};
+const double delta[] = { 2.000, 2.0, 2.0, 1.047 };
+const double pgain[] = { 0.020, 0.1, 0.1, 0.010 };
+const double dgain[] = { 0.005, 0.1, 0.1, 0.001 };
 
-}  // namespace
+} // namespace
 
-class YourDroneController : public SimpleController
+class YourDroneController : public cnoid::SimpleController
 {
-    SimplePilot pilot;
-    DeviceList<Rotor> rotors;
-    Vector4 zref;
-    Vector4 dzref, dzold;
-    Vector2 dxref;
-    bool manualMode;
-    double timeStep;
-
-    struct ActionInfo
-    {
-        int actionId;
-        int buttonId;
-        bool prevButtonState;
-        bool stateChanged;
-
-        ActionInfo(int actionId, int buttonId)
-            : actionId(actionId)
-            , buttonId(buttonId)
-            , prevButtonState(false)
-            , stateChanged(false)
-        {}
-    };
-
-    std::vector<ActionInfo> actions;
-
-    SharedJoystickPtr joystick;
-    int targetMode;
-
 public:
-    virtual bool initialize(SimpleControllerIO* io) override
-    {
-        Body* body = io->body();
-        rotors = body->devices();
-        manualMode = false;
+    virtual bool configure(cnoid::SimpleControllerConfig* config) override;
+    virtual bool initialize(cnoid::SimpleControllerIO* io) override;
+    virtual bool start() override;
+    virtual bool control() override;
+    virtual void stop() override;
+    virtual void unconfigure() override;
 
-        pilot.setStickMode(StickMode::MODE1);
-        if (pilot.initialize(io)) {
-            if (!pilot.findRateGyroSensor("GyroSensor")) {
-                return false;
-            }
-        }
+private:
+    cnoid::SimpleControllerIO* io;
+    cnoid::BodyPtr ioBody;
+    cnoid::DeviceList<cnoid::Rotor> rotors;
+    cnoid::RateGyroSensor* gyroSensor;
+    cnoid::Vector4 zref, zprev;
+    cnoid::Vector4 dzref, dzprev;
+    cnoid::Vector2 xref, xprev;
+    cnoid::Vector2 dxref, dxprev;
+    double timeStep;
+    double time;
+    double durationn;
+    bool is_powered_on;
 
-        std::string device = "/dev/input/js0";
-        for (auto opt : io->options()) {
-            if (opt == "manual") {
-                manualMode = true;
-            }
-            if (opt == "/dev/input/js1") {
-                device = "/dev/input/js1";
-            }
-        }
+    rclcpp::Node::SharedPtr node;
+    rclcpp::Publisher<sensor_msgs::msg::BatteryState>::SharedPtr publisher;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr subscription;
+    geometry_msgs::msg::Twist command;
+    rclcpp::executors::StaticSingleThreadedExecutor::UniquePtr executor;
+    std::thread executorThread;
+    std::mutex commandMutex;
+    std::mutex batteryMutex;
+    std::string topic_name;
+    std::string controller_name;
 
-        for (auto& rotor : rotors) {
-            io->enableInput(rotor);
-        }
-
-        zref = pilot.zrpy();
-        dzref = dzold = Vector4::Zero();
-        dxref = Vector2::Zero();
-
-        timeStep = io->timeStep();
-
-        actions = {{0, Joystick::B_BUTTON}};
-
-        joystick = io->getOrCreateSharedObject<SharedJoystick>("joystick");
-        targetMode = joystick->addMode();
-
-        return true;
-    }
-
-    virtual bool control() override
-    {
-        joystick->updateState(targetMode);
-        pilot.readCurrentState();
-
-        for (auto& info : actions) {
-            bool stateChanged = false;
-            bool buttonState = joystick->getButtonState(targetMode,
-                                                        info.buttonId);
-            if (buttonState && !info.prevButtonState) {
-                stateChanged = true;
-            }
-            info.prevButtonState = buttonState;
-            if (stateChanged) {
-                if (info.actionId == 0) {
-                    pilot.switchMode();
-                }
-            }
-        }
-
-        static const int controlID[] = {FlightControl::THROTTLE,
-                                        FlightControl::AILERON,
-                                        FlightControl::ELEVATOR,
-                                        FlightControl::RUDDER};
-
-        double pos[4];
-        for (int i = 0; i < 4; i++) {
-            pos[i] = joystick->getPosition(targetMode,
-                                           pilot.axisId(controlID[i]));
-            if (fabs(pos[i]) < 0.2) {
-                pos[i] = 0.0;
-            }
-        }
-
-        Vector4 fz = Vector4::Zero();
-        Vector4 z = pilot.zrpy();
-        Vector4 dz = pilot.dzrpy();
-        Vector4 ddz = (dz - dzold) / timeStep;
-
-        Vector2 dx_local = pilot.dxy_local();
-        Vector2 ddx_local = pilot.ddxy_local();
-        double gc = pilot.gravityCompensation(4);
-
-        if ((fabs(degree(z[1])) > 45.0) || (fabs(degree(z[2])) > 45.0)) {
-            pilot.on(false);
-        }
-
-        if (!pilot.on()) {
-            zref[0] = 0.0;
-            dzref[0] = 0.0;
-        }
-
-        static const double P = 1.0;
-        static const double D = 1.0;
-
-        for (int i = 0; i < 4; i++) {
-            if (i == 3) {
-                dzref[i] = -1.0 * pos[i];
-                fz[i] = (dzref[i] - dz[i]) * pgain[i]
-                        + (0.0 - ddz[i]) * dgain[i];
-            } else {
-                if (i == 0) {
-                    zref[i] += -0.001 * pos[i];
-                } else {
-                    if (manualMode) {
-                        zref[i] = (i == 1 ? 1.0 : -1.0) * pos[i];
-                    } else {
-                        int j = i - 1;
-                        dxref[j] = -1.0 * pos[i];
-                        zref[i] = P * (dxref[j] - dx_local[1 - j])
-                                  + D * (0.0 - ddx_local[1 - j]);
-                    }
-                }
-                if (i == 1) {
-                    zref[i] *= -1.0;
-                }
-                fz[i] = (zref[i] - z[i]) * pgain[i] + (0.0 - dz[i]) * dgain[i];
-            }
-        }
-        dzold = dz;
-
-        static const double TD[4][4] = {{1.0, -1.0, -1.0, -1.0},
-                                        {1.0, 1.0, -1.0, 1.0},
-                                        {1.0, 1.0, 1.0, -1.0},
-                                        {1.0, -1.0, 1.0, 1.0}};
-        static const double ATD[] = {-1.0, 1.0, -1.0, 1.0};
-
-        for (size_t i = 0; i < rotors.size(); i++) {
-            Rotor* rotor = rotors[i];
-            double ft = pilot.on() ? gc + TD[i][0] * fz[0] + TD[i][1] * fz[1]
-                                         + TD[i][2] * fz[2] + TD[i][3] * fz[3]
-                                   : 0.0;
-            rotor->force() = ft;
-            rotor->torque() = ATD[i] * ft;
-            rotor->notifyStateChange();
-        }
-
-        return true;
-    }
+    cnoid::Vector4 getZRPY();
+    cnoid::Vector2 getXY();
 };
 
 CNOID_IMPLEMENT_SIMPLE_CONTROLLER_FACTORY(YourDroneController)
+
+bool YourDroneController::configure(cnoid::SimpleControllerConfig* config)
+{
+    controller_name = config->controllerName();
+    return true;
+}
+
+bool YourDroneController::initialize(cnoid::SimpleControllerIO* io)
+{
+    this->io = io;
+    ioBody = io->body();
+    rotors = io->body()->devices();
+    gyroSensor = ioBody->findDevice<cnoid::RateGyroSensor>("GyroSensor");
+    is_powered_on = true;
+
+    topic_name.clear();
+    bool is_topic = false;
+    for(auto opt : io->options()) {
+        if(opt == "topic") {
+            is_topic = true;
+        } else if(is_topic) {
+            topic_name = opt;
+            break;
+        }
+    }
+    if(topic_name.empty()) {
+        topic_name = "cmd_vel";
+    }
+
+    io->enableInput(ioBody->rootLink(), cnoid::Link::LinkPosition);
+    io->enableInput(gyroSensor);
+    io->os() << gyroSensor->name() << std::endl;
+
+    for(auto& rotor : rotors) {
+        io->enableInput(rotor);
+    }
+
+    zref = zprev = getZRPY();
+    dzref = dzprev = cnoid::Vector4::Zero();
+    xref = xprev = getXY();
+    dxref = dxprev = cnoid::Vector2::Zero();
+
+    timeStep = io->timeStep();
+    time = durationn = 60.0 * 40.0;
+
+    return true;
+}
+
+bool YourDroneController::start()
+{
+    node = std::make_shared<rclcpp::Node>(controller_name);
+
+    publisher = node->create_publisher<sensor_msgs::msg::BatteryState>("/battery_status", 10);
+    subscription = node->create_subscription<geometry_msgs::msg::Twist>(
+        topic_name, 1, [this](const geometry_msgs::msg::Twist::SharedPtr msg) {
+            std::lock_guard<std::mutex> lock(commandMutex);
+            command = *msg;
+        });
+
+    executor = std::make_unique<rclcpp::executors::StaticSingleThreadedExecutor>();
+    executor->add_node(node);
+    executorThread = std::thread([this]() { executor->spin(); });
+
+    return true;
+}
+
+bool YourDroneController::control()
+{
+    // vel[z, r, p, y]
+    static double vel[] = { 2.0, 2.0, 2.0, 1.047 };
+    double val[] = { command.linear.z, command.linear.y, command.linear.x, command.angular.z };
+    for(int i = 0; i < 4; ++i) {
+        if(val[i] > 0.0) {
+            val[i] = val[i] > vel[i] ? vel[i] : val[i];
+        } else if(val[i] < 0.0) {
+            val[i] = val[i] < -vel[i] ? -vel[i] : val[i];
+        }
+        val[i] = val[i] / vel[i] * -1.0;
+    }
+
+    double pos[4];
+    for(int i = 0; i < 4; ++i) {
+        pos[i] = val[i];
+        if(fabs(pos[i]) < 0.2) {
+            pos[i] = 0.0;
+        }
+    }
+
+    cnoid::Vector4 fz = cnoid::Vector4::Zero();
+    cnoid::Vector4 z = getZRPY();
+    cnoid::Vector4 dz = (z - zprev) / timeStep;
+    if(gyroSensor) {
+        cnoid::Vector3 w = gyroSensor->w();
+        dz[1] = w[0];
+        dz[2] = w[1];
+        dz[3] = w[2];
+    }
+    cnoid::Vector4 ddz = (dz - dzprev) / timeStep;
+
+    cnoid::Vector2 x = getXY();
+    cnoid::Vector2 dx = (x - xprev) / timeStep;
+    cnoid::Vector2 ddx = (dx - dxprev) / timeStep;
+    cnoid::Vector2 dx_local = Eigen::Rotation2Dd(-z[3]) * dx;
+    cnoid::Vector2 ddx_local = Eigen::Rotation2Dd(-z[3]) * ddx;
+
+    double cc = cos(z[1]) * cos(z[2]);
+    double gc = ioBody->mass() * 9.80665 / 4.0 / cc;
+
+    if((fabs(cnoid::degree(z[1])) > 45.0) || (fabs(cnoid::degree(z[2])) > 45.0)) {
+        is_powered_on = false;
+    }
+
+    static const double P = 1.0;
+    static const double D = 1.0;
+
+    for(int i = 0; i < 4; ++i) {
+        if(i == 0 || i == 3) {
+            dzref[i] = -delta[i] * pos[i];
+            fz[i] = (dzref[i] - dz[i]) * pgain[i] + (0.0 - ddz[i]) * dgain[i];
+        } else {
+            int j = i - 1;
+            dxref[j] = -delta[i] * pos[i];
+            zref[i] = P * (dxref[j] - dx_local[1 - j]) + D * (0.0 - ddx_local[1 - j]);
+            zref[i] = (i != 1 ? 1.0 : -1.0) * zref[i];
+            fz[i] = (zref[i] - z[i]) * pgain[i] + (0.0 - dz[i]) * dgain[i];
+        }
+    }
+    zprev = z;
+    dzprev = dz;
+    xprev = x;
+    dxprev = dx;
+
+    static const double ATD[] = { -1.0, 1.0, -1.0, 1.0 };
+    double thr[4] = { 0.0 };
+    if(is_powered_on) {
+        thr[0] = gc + fz[0] - fz[1] - fz[2] - fz[3];
+        thr[1] = gc + fz[0] + fz[1] - fz[2] + fz[3];
+        thr[2] = gc + fz[0] + fz[1] + fz[2] - fz[3];
+        thr[3] = gc + fz[0] - fz[1] + fz[2] + fz[3];
+    }
+
+    for(size_t i = 0; i < rotors.size(); ++i) {
+        cnoid::Rotor* rotor = rotors[i];
+        rotor->force() = thr[i];
+        rotor->torque() = ATD[i] * thr[i];
+        rotor->notifyStateChange();
+    }
+
+    if(is_powered_on) {
+        time -= timeStep;
+    }
+    double percentage = time / durationn * 100.0;
+
+    {
+        std::lock_guard<std::mutex> lock(batteryMutex);
+        auto message = sensor_msgs::msg::BatteryState();
+        message.voltage = 15.0;
+        message.percentage = percentage > 0.0 ? percentage : 0.0;
+        publisher->publish(message);
+    }
+
+    if(percentage <= 0.0) {
+        is_powered_on = false;
+    }
+
+    return true;
+}
+
+void YourDroneController::stop()
+{
+    if(executor) {
+        executor->cancel();
+        executorThread.join();
+        executor->remove_node(node);
+        executor.reset();
+    }
+}
+
+void YourDroneController::unconfigure()
+{
+}
+
+cnoid::Vector4 YourDroneController::getZRPY()
+{
+    auto T = ioBody->rootLink()->position();
+    double z = T.translation().z();
+    cnoid::Vector3 rpy = cnoid::rpyFromRot(T.rotation());
+    return cnoid::Vector4(z, rpy[0], rpy[1], rpy[2]);
+}
+
+cnoid::Vector2 YourDroneController::getXY()
+{
+    auto p = ioBody->rootLink()->translation();
+    return cnoid::Vector2(p.x(), p.y());
+}
