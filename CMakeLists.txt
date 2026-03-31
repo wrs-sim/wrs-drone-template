@@ -9,4 +9,4 @@ else()
   message(STATUS "ament_cmake not found.")
 endif()
 
-install(DIRECTORY model project DESTINATION ${CNOID_SHARE_SUBDIR}/wrs)
+install(DIRECTORY model project DESTINATION ${CNOID_SHARE_SUBDIR}/WRS2025)

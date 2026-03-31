@@ -9,7 +9,6 @@
 #include <cnoid/SimpleController>
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-#include <sensor_msgs/msg/battery_state.hpp>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -42,18 +41,14 @@ private:
     cnoid::Vector2 xref, xprev;
     cnoid::Vector2 dxref, dxprev;
     double timeStep;
-    double time;
-    double durationn;
     bool is_powered_on;
 
     rclcpp::Node::SharedPtr node;
-    rclcpp::Publisher<sensor_msgs::msg::BatteryState>::SharedPtr publisher;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr subscription;
     geometry_msgs::msg::Twist command;
     rclcpp::executors::StaticSingleThreadedExecutor::UniquePtr executor;
     std::thread executorThread;
     std::mutex commandMutex;
-    std::mutex batteryMutex;
     std::string topic_name;
     std::string controller_name;
 
@@ -93,7 +88,6 @@ bool YourDroneController::initialize(cnoid::SimpleControllerIO* io)
 
     io->enableInput(ioBody->rootLink(), cnoid::Link::LinkPosition);
     io->enableInput(gyroSensor);
-    io->os() << gyroSensor->name() << std::endl;
 
     for(auto& rotor : rotors) {
         io->enableInput(rotor);
@@ -105,7 +99,6 @@ bool YourDroneController::initialize(cnoid::SimpleControllerIO* io)
     dxref = dxprev = cnoid::Vector2::Zero();
 
     timeStep = io->timeStep();
-    time = durationn = 60.0 * 40.0;
 
     return true;
 }
@@ -114,7 +107,6 @@ bool YourDroneController::start()
 {
     node = std::make_shared<rclcpp::Node>(controller_name);
 
-    publisher = node->create_publisher<sensor_msgs::msg::BatteryState>("/battery_status", 10);
     subscription = node->create_subscription<geometry_msgs::msg::Twist>(
         topic_name, 1, [this](const geometry_msgs::msg::Twist::SharedPtr msg) {
             std::lock_guard<std::mutex> lock(commandMutex);
@@ -208,23 +200,6 @@ bool YourDroneController::control()
         rotor->force() = thr[i];
         rotor->torque() = ATD[i] * thr[i];
         rotor->notifyStateChange();
-    }
-
-    if(is_powered_on) {
-        time -= timeStep;
-    }
-    double percentage = time / durationn * 100.0;
-
-    {
-        std::lock_guard<std::mutex> lock(batteryMutex);
-        auto message = sensor_msgs::msg::BatteryState();
-        message.voltage = 15.0;
-        message.percentage = percentage > 0.0 ? percentage : 0.0;
-        publisher->publish(message);
-    }
-
-    if(percentage <= 0.0) {
-        is_powered_on = false;
     }
 
     return true;
